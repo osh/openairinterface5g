@@ -40,14 +40,22 @@
 #define MAX_SLOTS_PER_MS 4
 #define SYMBOL_BITMASK_SIZE ((NR_SYMBOLS_PER_SLOT * MAX_TDD_PATTERN_LENGTH_MS * MAX_SLOTS_PER_MS + 7) / 8)
 #define MAX_RX_FRAGMENTS 4
+#define MAX_DL_CPLANE_SECTIONS 16
 #define MAX_MBUFS_PER_SYMBOL 64
 #define MAX_SLOTS_PER_FRAME 160
 #define XRAN_IQ_BITS_UNCOMPRESSED 16 /* xRAN table 7.7.1.1-1: udIqWidth=0 means 16-bit samples */
 
 typedef struct {
+  struct xran_cp_radioapp_section_header section;
+  uint8_t comp_method;
+  uint8_t iq_width;
+  uint8_t filter_id;
+} dl_cplane_section_t;
+
+typedef struct {
   struct {
-    bool cplane_received;
-    int section_id;
+    dl_cplane_section_t cplane_sections[MAX_DL_CPLANE_SECTIONS];
+    int num_cplane_sections;
     struct {
       int start_prbc;
       int num_prbc;
@@ -490,6 +498,19 @@ static void handle_dl_cplane_packet(oru_packet_processor_context_t *ctx,
     ctx->stats.dl_tdd_mismatch++;
     return;
   }
+  if (ant_id < 0 || ant_id >= MAX_ANTENNAS) {
+    ctx->stats.cplane_err_hdr++;
+    return;
+  }
+  dl_cplane_section_t command = {
+      .section = section->hdr,
+      .comp_method = hdr->udComp.udCompMeth,
+      .iq_width = hdr->udComp.udIqWidth == 0 ? XRAN_IQ_BITS_UNCOMPRESSED : hdr->udComp.udIqWidth,
+      .filter_id = hdr->cmnhdr.field.filterIndex,
+  };
+  // The window key already identifies the symbol; compare only its section description.
+  command.section.u.s1.numSymbol = 1;
+  command.section.u1.common.symInc = 0;
   for (int i = 0; i < num_symbols; i++) {
     uint32_t job_index = (target_absolute_symbol + i) % NUM_CONCURRENT_DL_SYMBOL_WINDOWS;
     dl_symbol_job_t *job = ctx->dl_symbol_rx_window[job_index];
@@ -506,7 +527,7 @@ static void handle_dl_cplane_packet(oru_packet_processor_context_t *ctx,
       job->comp_method = FH_COMP_NONE;
       job->iq_width = 16;
       for (int j = 0; j < MAX_ANTENNAS; j++) {
-        job->per_antenna[j].cplane_received = false;
+        job->per_antenna[j].num_cplane_sections = 0;
         job->per_antenna[j].num_rx_fragments = 0;
         for (int k = 0; k < MAX_RX_FRAGMENTS; k++) {
           job->per_antenna[j].rx_fragments[k].iq_data = NULL;
@@ -520,13 +541,25 @@ static void handle_dl_cplane_packet(oru_packet_processor_context_t *ctx,
         ctx->stats.cplane_err_late++;
         return;
       }
-      if (job->per_antenna[ant_id].cplane_received) {
-        ctx->stats.cplane_err_dup++;
-        ctx->stats.cplane_err_dup_dl++;
-        return;
+    }
+    // O-RAN CUS, 7.4.1.2 couples sections by ID or time/frequency; an antenna/symbol alone is not a duplicate key.
+    bool duplicate = false;
+    for (int j = 0; j < job->per_antenna[ant_id].num_cplane_sections; j++) {
+      const dl_cplane_section_t *previous = &job->per_antenna[ant_id].cplane_sections[j];
+      if (memcmp(&previous->section, &command.section, sizeof(command.section)) == 0 && previous->comp_method == command.comp_method
+          && previous->iq_width == command.iq_width && previous->filter_id == command.filter_id) {
+        duplicate = true;
+        break;
       }
     }
-    job->per_antenna[ant_id].section_id = section->hdr.u1.common.sectionId;
+    if (duplicate) {
+      ctx->stats.cplane_err_dup++;
+      ctx->stats.cplane_err_dup_dl++;
+      continue;
+    }
+    // A full history must not discard a distinct section; excess sections remain untracked.
+    if (job->per_antenna[ant_id].num_cplane_sections < MAX_DL_CPLANE_SECTIONS)
+      job->per_antenna[ant_id].cplane_sections[job->per_antenna[ant_id].num_cplane_sections++] = command;
     job->expected_iq += section->hdr.u1.common.numPrbc == 0 ? ctx->num_prb : section->hdr.u1.common.numPrbc;
     job->comp_method = (fh_comp_method_t)hdr->udComp.udCompMeth;
     job->iq_width = hdr->udComp.udIqWidth == 0 ? XRAN_IQ_BITS_UNCOMPRESSED : hdr->udComp.udIqWidth;
