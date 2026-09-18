@@ -17,6 +17,7 @@ typedef struct {
   uint16_t port_id;
   uint16_t queue_id;
   rte_spinlock_t tx_lock;
+  uint64_t tx_retry_cycles;
 } fh_send_t;
 
 /**
