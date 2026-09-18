@@ -163,7 +163,7 @@ static void generate_table(nr_ssb_search_params_t *params,
                           symbol_rotation);
 }
 
-static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t sample_offset)
+static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t first_fft_sample, int freq_offset)
 {
   c16_t timeshift_symbol_rotation[params->ofdm_symbol_size];
   c16_t symbol_rotation[224];
@@ -173,15 +173,25 @@ static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t sample_offs
       (c16_t(*)[params->nb_antennas_rx][params->ofdm_symbol_size])params->rxdataF;
   dft_size_idx_t dftsize = get_dft(params->ofdm_symbol_size);
 
+  const bool correct_cfo = params->apply_freq_offset && freq_offset != 0;
+  const double off_angle = correct_cfo ? -2 * M_PI * freq_offset / params->sampling_rate : 0;
+  __attribute__((aligned(32))) c16_t corrected[params->ofdm_symbol_size];
+
   for (int symb = 0; symb < NR_N_SYMBOLS_SSB; symb++) {
-    // For Sidelink 16 frames worth of samples is processed to find SSB, for 5G-NR 2.
-    unsigned int rx_offset = sample_offset + params->nb_prefix_samples;
-    rx_offset += symb * (params->nb_prefix_samples + params->ofdm_symbol_size);
-    // use OFDM symbol from within 1/8th of the CP to avoid ISI
-    rx_offset -= params->nb_prefix_samples / params->ofdm_offset_divisor;
+    const uint32_t rx_offset = first_fft_sample + symb * (params->nb_prefix_samples + params->ofdm_symbol_size);
     for (unsigned char aa = 0; aa < params->nb_antennas_rx; aa++) {
       c16_t *rxF = rxdataF[symb][aa];
-      dft(dftsize, (int16_t *)&params->rxdata[aa][rx_offset], (int16_t *)rxF, 1);
+      const c16_t *input = &params->rxdata[aa][rx_offset];
+      if (correct_cfo) {
+        // Other candidates and frame searches share the input, including lookahead samples.
+        for (int n = 0; n < params->ofdm_symbol_size; n++) {
+          const double angle = (rx_offset + n) * off_angle;
+          corrected[n].r = (short)round(input[n].r * cos(angle) - input[n].i * sin(angle));
+          corrected[n].i = (short)round(input[n].r * sin(angle) + input[n].i * cos(angle));
+        }
+        input = corrected;
+      }
+      dft(dftsize, (int16_t *)input, (int16_t *)rxF, 1);
       apply_nr_rotation_symbol_RX(params->symbols_per_slot,
                                   params->slots_per_subframe,
                                   timeshift_symbol_rotation,
@@ -200,13 +210,17 @@ static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t sample_offs
  */
 bool nr_search_ssb_common(nr_ssb_search_params_t *params)
 {
+  if (params->ofdm_symbol_size <= 0 || params->rxdata_size < params->ofdm_symbol_size || params->search_size == 0
+      || params->ofdm_offset_divisor == 0)
+    return false;
+
   const uint32_t pssTime_sz = params->ofdm_symbol_size;
   c16_t(*pssTime)[pssTime_sz] = (c16_t(*)[pssTime_sz])params->pssTime;
 
   // Perform PSS search
   pss_search_t p_pss = (pss_search_t){.rxdata = params->rxdata,
                                       .nb_antennas_rx = params->nb_antennas_rx,
-                                      .rxdata_length = params->rxdata_size,
+                                      .rxdata_length = min(params->search_size, params->rxdata_size - params->ofdm_symbol_size + 1),
                                       .ofdm_symbol_size = params->ofdm_symbol_size,
                                       .nb_prefix_samples = params->nb_prefix_samples,
                                       .subcarrier_spacing = params->subcarrier_spacing,
@@ -214,10 +228,6 @@ bool nr_search_ssb_common(nr_ssb_search_params_t *params)
                                       .target_Nid_cell = params->target_nid_cell,
                                       .pssTime = (c16_t *)pssTime};
   nr_pss_info_t pss_info = pss_search_time_nr(&p_pss);
-
-  // This is the frequency offset that will be applied in the compensation,
-  // and it takes into account the values already applied previously during the loop.
-  int f_off_to_comp = 0;
 
   for (int p = 0; p < NUMBER_PSS_SEQUENCE; p++) {
     pss_detection_result_t *pss_res = &pss_info.pss_elem_info[p];
@@ -227,32 +237,24 @@ bool nr_search_ssb_common(nr_ssb_search_params_t *params)
     int freq_offset_pss = pss_res->freq_offset;
     int sync_pos = pss_res->pos;
 
-    const int ssb_time_offset = sync_pos - params->nb_prefix_samples;
+    // PSS position is the useful-symbol start; move each FFT slightly into the CP.
+    const int64_t first_fft_sample = (int64_t)sync_pos - params->nb_prefix_samples / params->ofdm_offset_divisor;
+    // TS 38.211, 7.4.3.1: an SS/PBCH block spans four OFDM symbols; check all FFT inputs.
+    const int64_t fft_end = first_fft_sample
+                            + (NR_N_SYMBOLS_SSB - 1) * (int64_t)(params->ofdm_symbol_size + params->nb_prefix_samples)
+                            + params->ofdm_symbol_size;
 
 #ifdef DEBUG_INITIAL_SYNCH
-    LOG_I(PHY, "Initial sync : Estimated PSS position %d, Nid2 %d, ssb time offset %d\n", sync_pos, p, ssb_time_offset);
+    LOG_I(PHY, "Initial sync: Estimated PSS position %d, Nid2 %d\n", sync_pos, pss_res->nid2);
 #endif
 
-    // Check that SSB fits within buffer
-    if (ssb_time_offset + NR_N_SYMBOLS_SSB * (params->ofdm_symbol_size + params->nb_prefix_samples) >= params->rxdata_size) {
-      LOG_D(PHY,
-            "SSB extends beyond buffer boundary (sync_pos %d, ssb_time_offset %d, buffer_size %d)\n",
-            sync_pos,
-            ssb_time_offset,
-            params->rxdata_size);
-      return false;
+    if (first_fft_sample < 0 || fft_end > params->rxdata_size) {
+      LOG_D(PHY, "SSB candidate at %d extends beyond the %u received samples\n", sync_pos, params->rxdata_size);
+      continue;
     }
 
-    // Apply frequency offset compensation if requested
-    if (params->apply_freq_offset && freq_offset_pss != 0) {
-      f_off_to_comp += freq_offset_pss;
-      compensate_freq_offset(params->rxdata, params->nb_antennas_rx, params->rxdata_size, f_off_to_comp, params->sampling_rate);
-      f_off_to_comp *= -1;
-    }
-
-    // Extract SSB symbols to frequency domain
-    // Symbol ordering: 0=PSS, 1=PBCH, 2=SSS, 3=PBCH
-    do_time_to_freq(params, ssb_time_offset);
+    // Symbol ordering: 0=PSS, 1=PBCH, 2=SSS, 3=PBCH.
+    do_time_to_freq(params, first_fft_sample, freq_offset_pss);
 
     // Perform SSS detection
     nr_sss_params_t p_sss = (nr_sss_params_t){.nb_antennas_rx = params->nb_antennas_rx,
@@ -328,7 +330,8 @@ static void nr_scan_ssb(void *arg)
         .symbols_per_slot = fp->symbols_per_slot,
         .first_carrier_offset = fp->first_carrier_offset,
         .N_RB_DL = fp->N_RB_DL,
-        .rxdata_size = fp->samples_per_frame,
+        .rxdata_size = (ssbInfo->nFrames - frame_id) * fp->samples_per_frame,
+        .search_size = fp->samples_per_frame,
         .rxdata = rxdataShift,
         .nb_prefix_samples = fp->nb_prefix_samples,
         .nb_prefix_samples0 = fp->nb_prefix_samples0,

@@ -220,7 +220,7 @@ nr_pss_info_t pss_search_time_nr(const pss_search_t *p)
       }
     }
 
-    avg /= (p->rxdata_length / 4);
+    avg /= (p->rxdata_length - 1) / 4 + 1;
     bool pss_not_found = (p->target_Nid_cell == -1 && peak_value < 5 * avg) 
                          || peak_position < p->nb_prefix_samples;
     pss_info.pss_elem_info[pss_count] = (pss_detection_result_t){

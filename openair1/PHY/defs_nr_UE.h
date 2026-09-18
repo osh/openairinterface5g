@@ -546,7 +546,8 @@ typedef struct {
   int symbols_per_slot;
   int first_carrier_offset;
   int N_RB_DL;
-  uint32_t rxdata_size;
+  uint32_t rxdata_size; // Received samples available per antenna, excluding allocation padding.
+  uint32_t search_size; // Exclusive bound on PSS candidate starts.
   c16_t **rxdata;
   int nb_prefix_samples;
   int nb_prefix_samples0;
