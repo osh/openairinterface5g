@@ -689,8 +689,11 @@ int nr_config_pusch_pdu(NR_UE_MAC_INST_t *mac,
 
     if (dci_format == NR_UL_DCI_FORMAT_0_0)
       add_pos = pusch_config_pdu->frequency_hopping ? pusch_dmrs_pos1 : pusch_dmrs_pos2;
-    else if (NR_DMRS_ulconfig != NULL)
-      add_pos = (NR_DMRS_ulconfig->dmrs_AdditionalPosition == NULL) ? 2 : *NR_DMRS_ulconfig->dmrs_AdditionalPosition;
+    else if (NR_DMRS_ulconfig && NR_DMRS_ulconfig->dmrs_AdditionalPosition) {
+      const long configured_pos = *NR_DMRS_ulconfig->dmrs_AdditionalPosition;
+      // TS 38.331, 6.3.2: DMRS-UplinkConfig {pos0, pos1, pos3} encodes pos3 as ordinal 2.
+      add_pos = configured_pos == NR_DMRS_UplinkConfig__dmrs_AdditionalPosition_pos3 ? pusch_dmrs_pos3 : configured_pos;
+    }
 
     /* DMRS */
     l_prime_mask = get_l_prime(pusch_config_pdu->nr_of_symbols,
