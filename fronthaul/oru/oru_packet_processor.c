@@ -34,6 +34,7 @@
 #define MAX_CONCURRENT_DL_JOBS (DL_JOB_RING_SIZE - 1)
 #define NUM_CONCURRENT_DL_SYMBOL_WINDOWS MAX_CONCURRENT_DL_JOBS
 #define NUM_CONCURRENT_UL_SYMBOL_WINDOWS 128
+#define MAX_UL_CPLANE_COMMANDS_PER_SYMBOL 16
 #define MAX_ANTENNAS 4
 #define NR_NUMBER_OF_SUBFRAMES_PER_FRAME 10
 #define MAX_TDD_PATTERN_LENGTH_MS 10
@@ -62,6 +63,22 @@ typedef struct {
   fh_comp_method_t comp_method;
   uint8_t iq_width;
 } dl_symbol_job_t;
+
+typedef struct {
+  uint16_t section_id;
+  uint16_t start_prb;
+  uint16_t num_prb;
+  uint8_t num_symbols;
+  uint8_t filter_id;
+  fh_comp_method_t comp_method;
+  uint8_t iq_width;
+} ul_cplane_command_t;
+
+typedef struct {
+  uint64_t absolute_symbol;
+  uint8_t num_commands;
+  ul_cplane_command_t commands[MAX_UL_CPLANE_COMMANDS_PER_SYMBOL];
+} ul_cplane_history_t;
 
 typedef struct {
   bool active;
@@ -95,6 +112,7 @@ typedef struct {
   dl_symbol_job_t dl_symbol_jobs[MAX_CONCURRENT_DL_JOBS];
   dl_symbol_job_t *dl_symbol_rx_window[NUM_CONCURRENT_DL_SYMBOL_WINDOWS];
   bool was_dl_symbol_completed[NUM_CONCURRENT_DL_SYMBOL_WINDOWS];
+  ul_cplane_history_t ul_cplane_history[NUM_CONCURRENT_UL_SYMBOL_WINDOWS][MAX_ANTENNAS];
   prach_job_t prach_jobs[MAX_SLOTS_PER_FRAME][MAX_ANTENNAS];
   uint64_t current_absolute_symbol;
   uint64_t window_tail_symbol;
@@ -574,6 +592,38 @@ static void handle_ul_cplane_packet(oru_packet_processor_context_t *ctx,
     ctx->stats.ul_tdd_mismatch++;
     return;
   }
+  if (ant_id < 0 || ant_id >= MAX_ANTENNAS) {
+    ctx->stats.cplane_err_hdr++;
+    return;
+  }
+
+  ul_cplane_history_t *history = &ctx->ul_cplane_history[target_absolute_symbol % NUM_CONCURRENT_UL_SYMBOL_WINDOWS][ant_id];
+  if (history->absolute_symbol != target_absolute_symbol) {
+    history->absolute_symbol = target_absolute_symbol;
+    history->num_commands = 0;
+  }
+  // O-RAN CUS, 7.4.1.2 permits distinct sections per symbol; compare the supported scheduling fields.
+  const ul_cplane_command_t command = {
+      .section_id = section->hdr.u1.common.sectionId,
+      .start_prb = section->hdr.u1.common.startPrbc,
+      .num_prb = section->hdr.u1.common.numPrbc == 0 ? ctx->num_prb : section->hdr.u1.common.numPrbc,
+      .num_symbols = num_symbols,
+      .filter_id = hdr->cmnhdr.field.filterIndex,
+      .comp_method = hdr->udComp.udCompMeth,
+      .iq_width = hdr->udComp.udIqWidth == 0 ? XRAN_IQ_BITS_UNCOMPRESSED : hdr->udComp.udIqWidth,
+  };
+  for (int i = 0; i < history->num_commands; i++) {
+    const ul_cplane_command_t *previous = &history->commands[i];
+    if (previous->section_id == command.section_id && previous->start_prb == command.start_prb
+        && previous->num_prb == command.num_prb && previous->num_symbols == command.num_symbols
+        && previous->filter_id == command.filter_id && previous->comp_method == command.comp_method
+        && previous->iq_width == command.iq_width) {
+      ctx->stats.cplane_err_dup++;
+      ctx->stats.cplane_err_dup_ul++;
+      return;
+    }
+  }
+
   ul_job_t *ul_job = NULL;
   if (rte_ring_dequeue(ctx->ul_free_jobs, (void **)&ul_job) == 0) {
     memset(ul_job, 0, sizeof(*ul_job));
@@ -591,6 +641,9 @@ static void handle_ul_cplane_packet(oru_packet_processor_context_t *ctx,
     ul_job->start_prb = section->hdr.u1.common.startPrbc;
     int ret = rte_ring_enqueue(ctx->ul_ready_jobs, (void *)ul_job);
     AssertFatal(ret == 0, "Failed to enqueue ul_job to ul_ready_jobs ring\n");
+    // Remember only queued work. A full history must not discard a new request.
+    if (history->num_commands < MAX_UL_CPLANE_COMMANDS_PER_SYMBOL)
+      history->commands[history->num_commands++] = command;
     oru_pcap_cplane_commit_pusch(snap);
   } else {
     ctx->stats.application_too_slow++;
