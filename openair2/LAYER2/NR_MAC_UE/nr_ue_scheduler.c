@@ -658,10 +658,14 @@ int nr_config_pusch_pdu(NR_UE_MAC_INST_t *mac,
     }
 
     /* FREQ_HOPPING_FLAG */
-    if (pusch_Config
-        && pusch_Config->frequencyHopping
-        && (pusch_Config->resourceAllocation != NR_PUSCH_Config__resourceAllocation_resourceAllocationType0)) {
-      pusch_config_pdu->frequency_hopping = dci->frequency_hopping_flag.val;
+    pusch_config_pdu->frequency_hopping = 0;
+    if (pusch_Config && pusch_Config->frequencyHopping
+        && pusch_Config->resourceAllocation != NR_PUSCH_Config__resourceAllocation_resourceAllocationType0
+        && dci->frequency_hopping_flag.val) {
+      // TS 38.211, Table 6.4.1.1.3-6 requires per-hop DMRS mapping, which the UE PHY does not implement.
+      LOG_E(NR_MAC, "PUSCH frequency hopping is not supported\n");
+      mac->stats.bad_dci++;
+      return -1;
     }
 
     /* MCS */
@@ -687,8 +691,12 @@ int nr_config_pusch_pdu(NR_UE_MAC_INST_t *mac,
     /* HARQ_PROCESS_NUMBER */
     pusch_config_pdu->pusch_data.harq_process_id = pid;
 
-    if (NR_DMRS_ulconfig != NULL)
-      add_pos = (NR_DMRS_ulconfig->dmrs_AdditionalPosition == NULL) ? 2 : *NR_DMRS_ulconfig->dmrs_AdditionalPosition;
+    // Non-hopping DCI 0_0 uses pos2, independently of the dedicated configuration (TS 38.214, 6.2.2).
+    if (dci_format == NR_UL_DCI_FORMAT_0_1 && NR_DMRS_ulconfig && NR_DMRS_ulconfig->dmrs_AdditionalPosition) {
+      const long configured_pos = *NR_DMRS_ulconfig->dmrs_AdditionalPosition;
+      // TS 38.331, 6.3.2 DMRS-UplinkConfig enumerates {pos0, pos1, pos3}; ordinal 2 means pos3.
+      add_pos = configured_pos == NR_DMRS_UplinkConfig__dmrs_AdditionalPosition_pos3 ? pusch_dmrs_pos3 : configured_pos;
+    }
 
     /* DMRS */
     l_prime_mask = get_l_prime(pusch_config_pdu->nr_of_symbols,
