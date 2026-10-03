@@ -237,6 +237,9 @@ void test_cplane_uplane_match()
   sec->hdr.u1.common.numPrbc = 1;
   *((uint64_t *)sec) = rte_be_to_cpu_64(*((uint64_t *)sec));
 
+  // Copy before parsing converts the packet headers in place.
+  struct rte_mbuf *duplicate = rte_pktmbuf_copy(c_mbuf, mp, 0, UINT32_MAX);
+  assert(duplicate != NULL);
   handle_cplane_packet(ctx, c_mbuf);
 
   oru_packet_processor_stats_t stats;
@@ -246,6 +249,10 @@ void test_cplane_uplane_match()
   assert(stats.total_cplane == 1);
   assert(stats.dl_tdd_mismatch == 0);
   assert(stats.ul_tdd_mismatch == 0);
+
+  handle_cplane_packet(ctx, duplicate);
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 1);
 
   // Advance time so U-plane is in valid range (target_sym = current_sym + 4 -> 4 is between 2 and 8)
   current_sym += 3;
@@ -278,7 +285,10 @@ void test_cplane_uplane_match()
   iq[2] = 0xDD22;
   iq[3] = 0xCC33;
 
+  const int ready_before = get_ready_job_count(ctx);
   handle_uplane_packet(ctx, u_mbuf);
+  // A repeated C-plane command must not inflate the IQ needed for completion.
+  assert(get_ready_job_count(ctx) == ready_before + 1);
 
   get_packet_processor_stats(ctx, &stats);
   assert(stats.uplane_err_early == 0);
@@ -1816,12 +1826,97 @@ void test_large_delay_profile()
   printf("Large delay profile test passed!\n");
 }
 
+static void send_dl_section(void *ctx, uint64_t symbol, int section_id, int start_prb, int num_symbols)
+{
+  struct rte_mbuf *pkt = rte_pktmbuf_alloc(mp);
+  assert(pkt != NULL);
+  struct xran_ecpri_hdr *ecpri = (void *)rte_pktmbuf_append(pkt, sizeof(*ecpri));
+  assert(ecpri != NULL);
+  memset(ecpri, 0, sizeof(*ecpri));
+  ecpri->ecpri_xtc_id = xran_compose_cid(&g_eaxcid_config, 0, 0, 0, 0);
+  struct xran_cp_radioapp_section1_header *hdr = (void *)rte_pktmbuf_append(pkt, sizeof(*hdr));
+  assert(hdr != NULL);
+  memset(hdr, 0, sizeof(*hdr));
+  hdr->cmnhdr.field.dataDirection = XRAN_DIR_DL;
+  hdr->cmnhdr.field.payloadVer = XRAN_PAYLOAD_VER;
+  hdr->cmnhdr.field.frameId = (symbol / 280) % 256;
+  hdr->cmnhdr.field.subframeId = (symbol % 280) / 28;
+  hdr->cmnhdr.field.slotId = (symbol / 14) % 2;
+  hdr->cmnhdr.field.startSymbolId = symbol % 14;
+  hdr->cmnhdr.numOfSections = 1;
+  hdr->cmnhdr.sectionType = XRAN_CP_SECTIONTYPE_1;
+  hdr->cmnhdr.field.all_bits = rte_cpu_to_be_32(hdr->cmnhdr.field.all_bits);
+  struct xran_cp_radioapp_section1 *sec = (void *)rte_pktmbuf_append(pkt, sizeof(*sec));
+  assert(sec != NULL);
+  memset(sec, 0, sizeof(*sec));
+  sec->hdr.u.s1.numSymbol = num_symbols;
+  sec->hdr.u.s1.reMask = 0xfff;
+  sec->hdr.u1.common.sectionId = section_id;
+  sec->hdr.u1.common.startPrbc = start_prb;
+  sec->hdr.u1.common.numPrbc = 20;
+  *((uint64_t *)sec) = rte_cpu_to_be_64(*((uint64_t *)sec));
+  handle_cplane_packet(ctx, pkt);
+}
+
+static void test_dl_duplicate_sections(void)
+{
+  void *ctx = init_packet_processor(1,
+                                    100,
+                                    200,
+                                    400,
+                                    100,
+                                    300,
+                                    5,
+                                    0,
+                                    0,
+                                    0,
+                                    5,
+                                    test_alloc_mbuf,
+                                    test_send_mbuf,
+                                    NULL,
+                                    1500,
+                                    0,
+                                    FH_COMP_NONE,
+                                    0);
+  assert(ctx != NULL);
+  handle_absolute_symbol_tick(ctx, 1000);
+  send_dl_section(ctx, 1006, 1, 0, 1);
+  send_dl_section(ctx, 1006, 2, 20, 1);
+  oru_packet_processor_stats_t stats;
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 0);
+  send_dl_section(ctx, 1006, 1, 0, 1); // Replay an earlier, not just the latest, section.
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 1);
+  send_dl_section(ctx, 1006, 1, 0, 2); // Duplicate first symbol must not suppress the second.
+  send_dl_section(ctx, 1007, 1, 0, 1);
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 3);
+  send_dl_section(ctx, 1006, 4095, 40, 1);
+  send_dl_section(ctx, 1006, 4095, 60, 1); // Shared section ID with different PRB ranges.
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 3);
+  for (int i = 0; i < 17; i++)
+    send_dl_section(ctx, 1008, 100 + i, 0, 1);
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 3);
+  send_dl_section(ctx, 1008, 100, 0, 1); // An early entry remains tracked after the cache fills.
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 4);
+  send_dl_section(ctx, 1008, 116, 0, 1); // The uncached overflow entry is accepted conservatively.
+  get_packet_processor_stats(ctx, &stats);
+  assert(stats.cplane_err_dup_dl == 4);
+  cleanup_packet_processor(ctx);
+}
+
 int main(int argc, char **argv)
 {
   setup_dpdk(argc, argv);
   test_uplink_prb_offset();
   usleep(10000); // Delay is needed to let dpdk cleanup internal structures between cleanup/init calls
   test_init_cleanup();
+  usleep(10000);
+  test_dl_duplicate_sections();
   usleep(10000);
   test_cplane_timing_errors();
   usleep(10000);
