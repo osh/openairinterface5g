@@ -331,8 +331,6 @@ static inline void applyGtoright(const t_nrPolar_params *pp, decoder_node_t *nod
   }
 }
 
-static const int64_t all11[4] = {-1, -1, -1, -1};
-
 static inline void computeBeta(decoder_node_t *node)
 {
   int8_t *betav = treeBeta(node);
@@ -355,18 +353,24 @@ static inline void computeBeta(decoder_node_t *node)
       memset(betar, -1, sz);
       node->right->betaInit = true;
     }
-    int avx2mod = sz & 31;
-    if (avx2mod == 0) {
-      int avx2len = sz / 16;
-      for (int i = 0; i < avx2len; i++) {
-        ((simde__m256i *)betav)[i] =
-            simde_mm256_xor_si256(simde_mm256_xor_si256(((simde__m256i *)betar)[i], ((simde__m256i *)betal)[i]),
-                                  *(simde__m256i *)all11);
-      }
-    } else {
-      ((simde__m128i *)betav)[0] =
-          simde_mm_xor_si128(simde_mm_xor_si128(((simde__m128i *)betar)[0], ((simde__m128i *)betal)[0]), *((simde__m128i *)all11));
+    // Preserve the polar transform (TS 38.212, 5.3.1.2) without accessing beyond either child.
+    int i = 0;
+    const simde__m256i all_ones_256 = simde_mm256_set1_epi8(-1);
+    for (; i + 32 <= sz; i += 32) {
+      const simde__m256i left = simde_mm256_loadu_si256((const simde__m256i *)&betal[i]);
+      const simde__m256i right = simde_mm256_loadu_si256((const simde__m256i *)&betar[i]);
+      const simde__m256i combined = simde_mm256_xor_si256(simde_mm256_xor_si256(right, left), all_ones_256);
+      simde_mm256_storeu_si256((simde__m256i *)&betav[i], combined);
     }
+    if (i + 16 <= sz) {
+      const simde__m128i left = simde_mm_loadu_si128((const simde__m128i *)&betal[i]);
+      const simde__m128i right = simde_mm_loadu_si128((const simde__m128i *)&betar[i]);
+      const simde__m128i combined = simde_mm_xor_si128(simde_mm_xor_si128(right, left), simde_mm_set1_epi8(-1));
+      simde_mm_storeu_si128((simde__m128i *)&betav[i], combined);
+      i += 16;
+    }
+    for (; i < sz; ++i)
+      betav[i] = ~(betar[i] ^ betal[i]);
   } else {
     assert(node->right->betaInit);
     memcpy(betav, betar, sz * sizeof(*betav));
