@@ -164,7 +164,7 @@ static void generate_table(nr_ssb_search_params_t *params,
                           symbol_rotation);
 }
 
-static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t sample_offset)
+static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t sample_offset, int freq_offset)
 {
   c16_t timeshift_symbol_rotation[params->ofdm_symbol_size];
   c16_t symbol_rotation[224];
@@ -174,6 +174,11 @@ static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t sample_offs
       (c16_t(*)[params->nb_antennas_rx][params->ofdm_symbol_size])params->rxdataF;
   dft_size_idx_t dftsize = get_dft(params->ofdm_symbol_size);
 
+  // CFO is corrected on a copy of each FFT input: rxdata is shared by the other PSS candidates
+  const bool correct_cfo = params->apply_freq_offset && freq_offset != 0;
+  const double off_angle = correct_cfo ? -2 * M_PI * freq_offset / params->sampling_rate : 0;
+  __attribute__((aligned(32))) c16_t corrected[params->ofdm_symbol_size];
+
   for (int symb = 0; symb < NR_N_SYMBOLS_SSB; symb++) {
     // For Sidelink 16 frames worth of samples is processed to find SSB, for 5G-NR 2.
     unsigned int rx_offset = sample_offset + params->nb_prefix_samples;
@@ -182,8 +187,17 @@ static void do_time_to_freq(nr_ssb_search_params_t *params, uint32_t sample_offs
     rx_offset -= params->nb_prefix_samples / params->ofdm_offset_divisor;
     for (unsigned char aa = 0; aa < params->nb_antennas_rx; aa++) {
       c16_t *rxF = rxdataF[symb][aa];
+      const c16_t *input = &params->rxdata[aa][rx_offset];
+      if (correct_cfo) {
+        for (int n = 0; n < params->ofdm_symbol_size; n++) {
+          const double angle = (rx_offset + n) * off_angle;
+          corrected[n].r = (short)round(input[n].r * cos(angle) - input[n].i * sin(angle));
+          corrected[n].i = (short)round(input[n].r * sin(angle) + input[n].i * cos(angle));
+        }
+        input = corrected;
+      }
       // OFDM Demod
-      dft(dftsize, (int16_t *)&params->rxdata[aa][rx_offset], (int16_t *)rxF, 1);
+      dft(dftsize, (int16_t *)input, (int16_t *)rxF, 1);
       // FFT-shift
       fftshift_inplace(rxF, params->N_RB_DL * NR_NB_SC_PER_RB, params->ofdm_symbol_size);
       // Phase compensation
@@ -219,10 +233,6 @@ bool nr_search_ssb_common(nr_ssb_search_params_t *params)
                                       .pssTime = (c16_t *)pssTime};
   nr_pss_info_t pss_info = pss_search_time_nr(&p_pss);
 
-  // This is the frequency offset that will be applied in the compensation,
-  // and it takes into account the values already applied previously during the loop.
-  int f_off_to_comp = 0;
-
   for (int p = 0; p < NUMBER_PSS_SEQUENCE; p++) {
     pss_detection_result_t *pss_res = &pss_info.pss_elem_info[p];
     if (!pss_res->success)
@@ -244,19 +254,12 @@ bool nr_search_ssb_common(nr_ssb_search_params_t *params)
             sync_pos,
             ssb_time_offset,
             params->rxdata_size);
-      return false;
+      continue; // a later candidate may still fit
     }
 
-    // Apply frequency offset compensation if requested
-    if (params->apply_freq_offset && freq_offset_pss != 0) {
-      f_off_to_comp += freq_offset_pss;
-      compensate_freq_offset(params->rxdata, params->nb_antennas_rx, params->rxdata_size, f_off_to_comp, params->sampling_rate);
-      f_off_to_comp *= -1;
-    }
-
-    // Extract SSB symbols to frequency domain
+    // Extract SSB symbols to frequency domain, compensating this candidate's frequency offset if requested
     // Symbol ordering: 0=PSS, 1=PBCH, 2=SSS, 3=PBCH
-    do_time_to_freq(params, ssb_time_offset);
+    do_time_to_freq(params, ssb_time_offset, freq_offset_pss);
 
     // Perform SSS detection
     nr_sss_params_t p_sss = (nr_sss_params_t){.nb_antennas_rx = params->nb_antennas_rx,
