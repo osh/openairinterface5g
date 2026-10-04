@@ -21,6 +21,7 @@ int main(int argc, char *argv[])
 
   int ret = 1;
   int arguments, iterations = 1000, messageLength = 11;
+  uint32_t maxBlockErrors = 0; // block errors tolerated at the last SNR
   // int matlabDebug = 0;
   uint32_t testInput, encoderOutput, codingDifference, nBitError = 0, blockErrorState = 0, blockErrorCumulative = 0,
                                                        bitErrorCumulative = 0;
@@ -38,7 +39,7 @@ int main(int argc, char *argv[])
   }
   logInit();
 
-  while ((arguments = getopt(argc, argv, "--:O:s:d:f:l:i:q:hg")) != -1) {
+  while ((arguments = getopt(argc, argv, "--:O:s:d:f:l:i:q:e:hg")) != -1) {
 
     /* ignore long options starting with '--', option '-O' and their arguments that are handled by configmodule */
     /* with this opstring getopt returns 1 for non-option arguments, refer to 'man 3 getopt' */
@@ -71,6 +72,10 @@ int main(int argc, char *argv[])
         iterations = atoi(optarg);
         break;
 
+      case 'e':
+        maxBlockErrors = atoi(optarg);
+        break;
+
       case 'g':
         iterations = 1;
         SNRstart = -6.0;
@@ -80,7 +85,7 @@ int main(int argc, char *argv[])
 
       case 'h':
         // printf("./smallblocktest -s SNRstart -d SNRinc -f SNRstop -l messageLength -i iterations -m Matlab Debug\n");
-        printf("./smallblocktest -s SNRstart -d SNRinc -f SNRstop -l messageLength -i iterations\n");
+        printf("./smallblocktest -s SNRstart -d SNRinc -f SNRstop -l messageLength -i iterations -q Qm -e maxBlockErrors\n");
         exit(-1);
 
       default:
@@ -176,7 +181,7 @@ int main(int argc, char *argv[])
   print_meas(&timeEncoder, "smallblock_encoder", NULL, NULL);
   print_meas(&timeDecoder, "smallblock_decoder", NULL, NULL);
 
-  if (blockErrorCumulative == 0) {
+  if (blockErrorCumulative <= maxBlockErrors) {
     ret = 0;
   }
 
